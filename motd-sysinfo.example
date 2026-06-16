@@ -1,0 +1,36 @@
+# Optional overrides for /etc/update-motd.d/01-sysinfo
+# Copy to /etc/default/motd-sysinfo to customize.
+
+# Display name in banner (default: short hostname)
+# MOTD_HOSTNAME="edge-01"
+
+# Accent colour for outer borders, hostname, clock, and CPU label.
+# SGR parameters (matches PS1 user@host colour by default), e.g.:
+#   MOTD_ACCENT_COLOR="01;32"      # classic bold green
+#   MOTD_ACCENT_COLOR="38;5;46"    # 256-colour green
+#   MOTD_ACCENT_COLOR=$'\033[01;32m'
+# MOTD_ACCENT_COLOR="01;32"
+
+# Whose shell init files supply the default accent when MOTD_ACCENT_COLOR is unset.
+# Reads ~/.bash_profile, ~/.profile, ~/.bashrc, then ~/.bash_aliases (last PS1 wins).
+# Default: SSH/PAM login user when available; else scan /home for PS1 with \\u@host;
+# else root (Debian/OMV direct root login reads /root/.bashrc and /root/.bash_aliases).
+# MOTD_COLOR_USER="kevyn"
+
+# Explicit shell init file instead of searching ~$MOTD_COLOR_USER/
+# MOTD_BASHRC="/home/kevyn/.bash_aliases"
+
+# Path to renderer (default: same dir as 01-sysinfo)
+# MOTD_RENDERER="/etc/update-motd.d/motd-render.py"
+
+# Max disk rows (always includes / first)
+# MOTD_MAX_DISKS=4
+
+# Link capacity (Mbps) used to scale download/upload meters (default: 100)
+# MOTD_NET_CAP_MBPS=1000
+
+# Space-separated systemd units to monitor (overrides auto-discovery when set).
+# When unset, enabled units from a built-in list are auto-detected:
+# docker, nginx, ssh, tailscaled, llama-swap, llama-server, cloudflared,
+# smartmontools, monit
+# MOTD_SERVICES="ssh docker tailscaled"

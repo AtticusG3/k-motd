@@ -1,0 +1,770 @@
+#!/bin/bash
+# /etc/update-motd.d/01-sysinfo
+# btop-style dynamic MOTD: bordered panels, meters, column tables
+
+set -euo pipefail
+
+[[ -f /etc/default/motd-sysinfo ]] && . <(tr -d '\r' < /etc/default/motd-sysinfo)
+
+RENDERER="${MOTD_RENDERER:-}"
+if [[ -z "$RENDERER" ]]; then
+    RENDERER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/motd-render.py"
+fi
+[[ -x "$RENDERER" || -f "$RENDERER" ]] || RENDERER="/etc/update-motd.d/motd-render.py"
+
+MOTD_MAX_DISKS=${MOTD_MAX_DISKS:-4}
+
+# ─────────────────────────────────────────────────────────────
+# Discovery
+# ─────────────────────────────────────────────────────────────
+
+host_name() {
+    local name
+    if [[ -n "${MOTD_HOSTNAME:-}" ]]; then
+        name=$MOTD_HOSTNAME
+    else
+        name=$(hostname -s 2>/dev/null || hostname)
+    fi
+    name=${name//$'\r'/}
+    printf '%s' "$name"
+}
+
+cpu_model() {
+    local model
+    model=$(lscpu 2>/dev/null | awk -F: '/Model name:/ {sub(/^ +/, "", $2); print $2; exit}')
+    [[ -n "$model" ]] || model=$(awk -F: '/model name/ {sub(/^ +/, "", $2); print $2; exit}' /proc/cpuinfo)
+    printf '%s' "$model"
+}
+
+cpu_usage_pct() {
+    local pct
+    pct=$(top -bn1 2>/dev/null | awk '/Cpu\(s\)/ {print int($2 + $4)}')
+    [[ -n "$pct" ]] && { printf '%s' "$pct"; return; }
+
+    awk '
+        function snap() {
+            getline < "/proc/stat"
+            total = $2 + $3 + $4 + $5 + $6 + $7 + $8
+            idle = $5 + $6
+            close("/proc/stat")
+            return total " " idle
+        }
+        BEGIN {
+            split(snap(), a, " ")
+            system("sleep 0.12")
+            split(snap(), b, " ")
+            dt = b[1] - a[1]
+            di = b[2] - a[2]
+            if (dt > 0) printf "%d", int((dt - di) * 100 / dt)
+            else print "0"
+        }
+    '
+}
+
+cpu_temp_c() {
+    local temp zone type
+
+    for zone in /sys/class/thermal/thermal_zone*/temp; do
+        [[ -r "$zone" ]] || continue
+        type=$(cat "${zone%/*}/type" 2>/dev/null)
+        [[ "$type" == *x86_pkg_temp* || "$type" == *cpu* || "$type" == *acpitz* ]] || continue
+        temp=$(awk '{printf "%d", $1/1000}' "$zone" 2>/dev/null)
+        [[ -n "$temp" && "$temp" -gt 0 ]] && { printf '%s' "$temp"; return; }
+    done
+
+    temp=$(sensors 2>/dev/null | awk -F'[+°C]' '/Package id|Tctl|Core 0/ {print $2; exit}')
+    [[ -n "$temp" ]] && printf '%.0f' "$temp"
+}
+
+cpu_freq_mhz() {
+    local f khz sum=0 count=0
+    for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do
+        [[ -r "$f" ]] || continue
+        read -r khz < "$f" 2>/dev/null || continue
+        [[ "$khz" =~ ^[0-9]+$ ]] || continue
+        sum=$((sum + khz))
+        ((count++))
+    done
+    if (( count > 0 )); then
+        printf '%d' $((sum / count / 1000))
+        return
+    fi
+    awk -F: '/cpu MHz/ {
+        sub(/^ +/, "", $2)
+        if ($2 ~ /^[0-9.]+$/) { printf "%.0f", $2; exit }
+    }' /proc/cpuinfo 2>/dev/null
+}
+
+# ─────────────────────────────────────────────────────────────
+# Theme / prompt colour (matches PS1 user@host by default)
+# ─────────────────────────────────────────────────────────────
+
+# >>> motd-theme (single resolver; sourceable for tests) >>>
+# Resolve the accent SGR by matching the login user's PS1 `\u@host` colour.
+# One Python pass does the whole job: pick the owning user (MOTD_COLOR_USER ->
+# non-root login env -> /home scan for `\u@host` -> root), resolve their shell
+# init files, and return the SGR of the last matching PS1 (else the teal default).
+# Uses `getent`/`hostname` via subprocess so tests can mock them on PATH.
+motd_accent_sgr() {
+    if [[ -n "${MOTD_ACCENT_COLOR:-}" ]]; then
+        printf '%s' "$MOTD_ACCENT_COLOR"
+        return 0
+    fi
+
+    python3 <<'PY'
+import os
+import re
+import subprocess
+
+DEFAULT = "38;5;43"
+INIT_FILES = (".bash_profile", ".profile", ".bashrc", ".bash_aliases")
+PS1_RE = re.compile(r"^(?:export\s+)?PS1\s*=")
+SGR_PATTERNS = (
+    re.compile(r"(?:\\033|\\e)\[([0-9;]+)m"),
+    re.compile(r"\\\[(?:\\033|\\e)\[([0-9;]+)m"),
+)
+
+
+def run(*args: str) -> str:
+    try:
+        return subprocess.check_output(args, text=True, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+
+
+def passwd_entries() -> list[list[str]]:
+    return [ln.split(":") for ln in run("getent", "passwd").splitlines() if ":" in ln]
+
+
+def home_for(user: str) -> str:
+    for f in passwd_entries():
+        if len(f) >= 6 and f[0] == user:
+            return f[5]
+    return ""
+
+
+def ps1_lines(path: str):
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if "PS1" in line and "=" in line and PS1_RE.search(line):
+            yield line
+
+
+def usable(fields: list[str]) -> bool:
+    if len(fields) < 7:
+        return False
+    try:
+        uid = int(fields[2])
+    except ValueError:
+        return False
+    if uid < 1000 or uid >= 65534:
+        return False
+    if fields[6] in ("/usr/sbin/nologin", "/bin/false", "/sbin/nologin"):
+        return False
+    return fields[5].startswith("/home/")
+
+
+def host_markers() -> list[str]:
+    host = run("hostname", "-s").strip()
+    markers = [r"\u@\h", r"\u@\H"]
+    if host:
+        markers.append(rf"\u@{host}")
+    return markers
+
+
+def ps1_has_host_marker(line: str, markers: list[str]) -> bool:
+    return any(m in line for m in markers)
+
+
+def guess_owning_user() -> str:
+    markers = host_markers()
+    for f in passwd_entries():
+        if usable(f) and any(
+            ps1_has_host_marker(line, markers)
+            for fn in INIT_FILES
+            for line in ps1_lines(os.path.join(f[5], fn))
+        ):
+            return f[0]
+    return ""
+
+
+def resolve_user() -> str:
+    forced = os.environ.get("MOTD_COLOR_USER")
+    if forced:
+        return forced
+    for var in ("PAM_USER", "SSH_ORIGINAL_USER", "LOGNAME", "USER"):
+        cand = os.environ.get(var)
+        if cand and cand != "root":
+            return cand
+    # update-motd runs as root; Debian/OMV often SSH as root -> scan /root.
+    return guess_owning_user() or "root"
+
+
+def init_files() -> list[str]:
+    bashrc = os.environ.get("MOTD_BASHRC")
+    if bashrc and os.path.isfile(bashrc):
+        return [bashrc]
+    user = resolve_user()
+    home = "/root" if user == "root" else (home_for(user) or "/root")
+    return [
+        os.path.join(home, fn)
+        for fn in INIT_FILES
+        if os.path.isfile(os.path.join(home, fn))
+    ]
+
+
+def last_sgr(fragment: str) -> str | None:
+    found = None
+    for pat in SGR_PATTERNS:
+        for match in pat.finditer(fragment):
+            found = match.group(1)
+    return found
+
+
+def accent_sgr() -> str:
+    found = None
+    for path in init_files():
+        for line in ps1_lines(path):
+            if r"\u@" not in line:
+                continue
+            idx = line.find(r"\u")
+            if idx < 0:
+                continue
+            sgr = last_sgr(line[:idx])
+            if sgr:
+                found = sgr
+    return found or DEFAULT
+
+
+print(accent_sgr())
+PY
+}
+# <<< motd-theme <<<
+# ─────────────────────────────────────────────────────────────
+# Terminal width
+# ─────────────────────────────────────────────────────────────
+
+terminal_width() {
+    local w="" f
+    f="/var/cache/motd-sysinfo/last_width"
+    if [[ -r "$f" ]]; then
+        read -r w < "$f" 2>/dev/null || w=""
+        w="${w//[!0-9]/}"
+        # Only trust cached value if reasonable.
+        (( ${w:-0} < 40 || ${w:-0} > 220 )) && w=""
+    fi
+    [[ -z "$w" ]] && w="${COLUMNS:-}"
+    [[ -z "$w" ]] && w=$(stty size 2>/dev/null | awk '{print $2}')
+    [[ -z "$w" ]] && w=$(tput cols 2>/dev/null)
+    [[ -z "$w" ]] && w=128
+    (( w > 220 )) && w=220
+    (( w < 20 )) && w=20
+    # Write back so the next login has a good value immediately.
+    # Subshell isolates any redirection/permission failure (file may be owned
+    # by another user) so no error leaks into the rendered MOTD.
+    mkdir -p "$(dirname "$f")" 2>/dev/null
+    ( printf '%s\n' "$w" > "$f" ) 2>/dev/null || true
+    printf '%s' "$w"
+}
+# ─────────────────────────────────────────────────────────────
+# JSON payload (single Python emit)
+# ─────────────────────────────────────────────────────────────
+
+motd_payload_json() {
+    python3 <<'PY'
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+from typing import Any
+
+SERVICE_CANDIDATES = (
+    "docker", "nginx", "ssh", "tailscaled", "llama-swap",
+    "llama-server", "cloudflared", "smartmontools", "monit",
+)
+VENDOR_INTEL = "0x8086"
+VENDOR_AMD = "0x1002"
+
+
+def run(cmd: list[str], timeout: float = 8.0) -> str:
+    try:
+        return subprocess.check_output(
+            cmd, text=True, stderr=subprocess.DEVNULL, timeout=timeout,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return ""
+
+
+def systemctl_ok(*args: str) -> bool:
+    return subprocess.call(
+        list(args), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ) == 0
+
+
+def read_int(path: str) -> int | None:
+    try:
+        raw = open(path, encoding="ascii", errors="replace").read().strip()
+        if re.fullmatch(r"-?[0-9]+", raw):
+            return int(raw)
+    except OSError:
+        pass
+    return None
+
+
+def read_pct(path: str) -> int | None:
+    val = read_int(path)
+    return None if val is None else max(0, min(100, val))
+
+
+def gpu_row(label: str, pct: int, **extra: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {"label": label, "pct": max(0, min(100, int(pct)))}
+    mem_used = extra.get("mem_used_mb")
+    mem_total = extra.get("mem_total_mb")
+    if mem_used is not None and mem_total is not None:
+        row["mem_used_mb"] = int(mem_used)
+        row["mem_total_mb"] = int(mem_total)
+    if extra.get("temp") is not None:
+        row["temp"] = int(extra["temp"])
+    if extra.get("power_w") is not None:
+        row["power_w"] = float(extra["power_w"])
+    return row
+
+
+def gpu_label(prefix: str, index: int, count: int) -> str:
+    return "GPU" if count == 1 else f"{prefix}{index}"
+
+
+def nvidia_gpus(rows: list[dict[str, Any]]) -> None:
+    lines = [
+        ln.strip()
+        for ln in run([
+            "nvidia-smi",
+            "--query-gpu=index,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+            "--format=csv,noheader,nounits",
+        ]).splitlines()
+        if ln.strip()
+    ]
+    n = len(lines)
+    for i, line in enumerate(lines):
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 6 or not parts[1].isdigit():
+            continue
+        idx = int(parts[0]) if parts[0].isdigit() else i
+        temp = int(parts[4]) if parts[4].isdigit() else None
+        power = float(parts[5]) if re.fullmatch(r"[0-9.]+", parts[5] or "") else None
+        rows.append(gpu_row(
+            gpu_label("N", idx, n), int(parts[1]),
+            mem_used_mb=int(parts[2]) if parts[2].isdigit() else None,
+            mem_total_mb=int(parts[3]) if parts[3].isdigit() else None,
+            temp=temp, power_w=power,
+        ))
+
+
+def rocm_cards() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not shutil.which("rocm-smi"):
+        return out
+
+    raw = run(["rocm-smi", "--json"])
+    if raw.strip():
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                keys = sorted(
+                    (k for k in data if re.fullmatch(r"card\d+", k)),
+                    key=lambda k: int(k[4:]) if k[4:].isdigit() else k,
+                )
+                for i, key in enumerate(keys):
+                    info = data[key]
+                    if not isinstance(info, dict):
+                        continue
+                    util = next(
+                        (int(str(v)) for k, v in info.items()
+                         if "GPU use" in k and str(v).strip().isdigit()),
+                        None,
+                    )
+                    if util is None:
+                        continue
+                    temp = next(
+                        (int(m.group(1)) for k, v in info.items()
+                         if "Temperature" in k and "Sensor" in k
+                         for m in [re.search(r"([0-9]+)", str(v))] if m),
+                        None,
+                    )
+                    mem_used = mem_total = None
+                    for k, v in info.items():
+                        if "VRAM Total Used Memory" in k and str(v).strip().isdigit():
+                            mem_used = int(v) // (1024 * 1024)
+                        if "VRAM Total Memory" in k and "Used" not in k and str(v).strip().isdigit():
+                            mem_total = int(v) // (1024 * 1024)
+                    out.append(gpu_row(
+                        gpu_label("A", i, len(keys)), util,
+                        mem_used_mb=mem_used, mem_total_mb=mem_total, temp=temp,
+                    ))
+                if out:
+                    return out
+        except json.JSONDecodeError:
+            pass
+
+    use_map: dict[str, int] = {}
+    for line in run(["rocm-smi", "--showuse"]).splitlines():
+        m = re.search(r"GPU\[([^\]]+)\].*?([0-9]+)\s*$", line)
+        if m:
+            use_map[m.group(1)] = int(m.group(2))
+    mem_used_b: dict[str, int] = {}
+    mem_total_b: dict[str, int] = {}
+    for line in run(["rocm-smi", "--showmeminfo", "vram"]).splitlines():
+        m = re.search(r"GPU\[([^\]]+)\].*Total Used Memory \(B\):\s*([0-9]+)", line)
+        if m:
+            mem_used_b[m.group(1)] = int(m.group(2))
+        m = re.search(r"GPU\[([^\]]+)\].*VRAM Total Memory \(B\):\s*([0-9]+)", line)
+        if m and "Used" not in line:
+            mem_total_b[m.group(1)] = int(m.group(2))
+    temp_c: dict[str, int] = {}
+    for line in run(["rocm-smi", "--showtemp"]).splitlines():
+        m = re.search(r"GPU\[([^\]]+)\].*?([0-9]+)", line)
+        if m:
+            temp_c[m.group(1)] = int(m.group(2))
+    keys = sorted(set(use_map) | set(mem_used_b) | set(mem_total_b) | set(temp_c))
+    n = len([k for k in keys if k in use_map])
+    for i, key in enumerate(keys):
+        if key not in use_map:
+            continue
+        used_mb = mem_used_b[key] // (1024 * 1024) if key in mem_used_b else None
+        total_mb = mem_total_b[key] // (1024 * 1024) if key in mem_total_b else None
+        out.append(gpu_row(
+            gpu_label("A", i, n), use_map[key],
+            mem_used_mb=used_mb, mem_total_mb=total_mb, temp=temp_c.get(key),
+        ))
+    return out
+
+
+def rocm_gpus(rows: list[dict[str, Any]]) -> None:
+    rows.extend(rocm_cards())
+
+
+def drm_gpus(rows: list[dict[str, Any]]) -> None:
+    has_rocm = any(str(r.get("label", "")).startswith("A") for r in rows)
+    for card in sorted(glob.glob("/sys/class/drm/card[0-9]")):
+        try:
+            vendor = open(
+                os.path.join(card, "device/vendor"),
+                encoding="ascii", errors="replace",
+            ).read().strip().lower()
+        except OSError:
+            continue
+        if vendor == VENDOR_INTEL:
+            pct = None
+            for path in glob.glob(os.path.join(card, "gt/gt*/gt_busy_percent")):
+                pct = read_pct(path)
+                if pct is not None:
+                    break
+            if pct is None:
+                for path in glob.glob(os.path.join(card, "engine/*/busy_percent")):
+                    pct = read_pct(path)
+                    if pct is not None:
+                        break
+            if pct is None:
+                pct = read_pct(os.path.join(card, "device/gpu_busy_percent"))
+            if pct is None:
+                continue
+            i = sum(1 for r in rows if str(r.get("label", "")).startswith("i"))
+            rows.append(gpu_row(gpu_label("i", i, 99), pct))
+        elif vendor == VENDOR_AMD and not has_rocm:
+            pct = read_pct(os.path.join(card, "device/gpu_busy_percent"))
+            if pct is None:
+                continue
+            i = sum(1 for r in rows if str(r.get("label", "")).startswith("G"))
+            rows.append(gpu_row(gpu_label("G", i, 99), pct))
+
+
+def collect_gpus() -> list[dict[str, Any]] | None:
+    rows: list[dict[str, Any]] = []
+    for collector in (nvidia_gpus, rocm_gpus, drm_gpus):
+        collector(rows)
+    if not rows:
+        return None
+    if len(rows) == 1:
+        rows[0]["label"] = "GPU"
+    return rows
+
+
+def mem_stats() -> dict[str, int]:
+    vals: dict[str, int] = {}
+    with open("/proc/meminfo", encoding="ascii", errors="replace") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] in (
+                "MemTotal:", "MemAvailable:", "Cached:", "MemFree:",
+            ):
+                vals[parts[0][:-1]] = int(parts[1])
+    total = vals.get("MemTotal", 0)
+    avail = vals.get("MemAvailable", 0)
+    return {
+        "total_kb": total,
+        "used_kb": total - avail,
+        "avail_kb": avail,
+        "cached_kb": vals.get("Cached", 0),
+        "free_kb": vals.get("MemFree", 0),
+    }
+
+
+def disk_rows() -> list[dict[str, Any]]:
+    max_disks = max(1, int(os.environ.get("MOTD_MAX_DISKS", "4")))
+    try:
+        out = subprocess.check_output([
+            "df", "-hT",
+            "--exclude-type=tmpfs", "--exclude-type=devtmpfs",
+            "--exclude-type=overlay", "--exclude-type=squashfs",
+            "--exclude-type=efivarfs", "--exclude-type=autofs",
+        ], text=True, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 7:
+            continue
+        mount = parts[6]
+        if re.match(r"^/(run|dev|proc|sys|boot)(/|$)", mount):
+            continue
+        pct = int(parts[5].rstrip("%")) if parts[5].rstrip("%").isdigit() else 0
+        rows.append({
+            "mount": mount, "pct": pct, "avail": parts[4], "fstype": parts[1],
+        })
+
+    root = [r for r in rows if r["mount"] == "/"]
+    rest = sorted([r for r in rows if r["mount"] != "/"], key=lambda r: -r["pct"])
+    ordered = (root + rest) if root else rest
+    return ordered[:max_disks]
+
+
+def net_totals() -> tuple[int, int]:
+    skip = re.compile(r"^(lo|docker|veth|br-|virbr)")
+
+    def snap() -> tuple[int, int]:
+        down = up = 0
+        with open("/proc/net/dev", encoding="ascii", errors="replace") as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                iface, rest = line.split(":", 1)
+                iface = iface.strip()
+                if skip.match(iface):
+                    continue
+                fields = rest.split()
+                if len(fields) < 9:
+                    continue
+                down += int(fields[0])
+                up += int(fields[8])
+        return down, up
+
+    sleep_s = 0.15
+    d0, u0 = snap()
+    time.sleep(sleep_s)
+    d1, u1 = snap()
+    return int((d1 - d0) / 1024 / sleep_s), int((u1 - u0) / 1024 / sleep_s)
+
+
+def net_addrs() -> dict[str, Any]:
+    cap: dict[str, Any] = {
+        "ipv4": None, "iface": None, "vpn_ipv4": None, "vpn_iface": None,
+    }
+
+    def ip_run(*args: str) -> str:
+        try:
+            return subprocess.check_output(
+                list(args), text=True, stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return ""
+
+    default_iface = ""
+    for line in ip_run("ip", "route", "show", "default").splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0] == "default":
+            default_iface = parts[4]
+            break
+
+    addrs: list[tuple[str, str]] = []
+    for line in ip_run("ip", "-4", "-o", "addr", "show", "scope", "global").splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        addrs.append((parts[1], parts[3].split("/")[0]))
+
+    vpn_ifaces = ("tailscale0", "wg0", "tun0", "nordlynx")
+    for iface, addr in addrs:
+        if iface in vpn_ifaces or iface.startswith("tailscale") or re.match(r"^100\.", addr):
+            cap["vpn_ipv4"] = addr
+            cap["vpn_iface"] = iface
+            break
+
+    for iface, addr in addrs:
+        if cap["vpn_ipv4"] and addr == cap["vpn_ipv4"]:
+            continue
+        if default_iface and iface == default_iface:
+            cap["ipv4"] = addr
+            cap["iface"] = iface
+            break
+
+    if not cap["ipv4"]:
+        for iface, addr in addrs:
+            if cap["vpn_ipv4"] and addr == cap["vpn_ipv4"]:
+                continue
+            cap["ipv4"] = addr
+            cap["iface"] = iface
+            break
+
+    return cap
+
+
+def collect_net() -> dict[str, Any]:
+    down, up = net_totals()
+    raw = os.environ.get("MOTD_NET_CAP_MBPS", "100").strip()
+    mbps = int(raw) if raw.isdigit() else 100
+    cap = mbps * 128
+    addrs = net_addrs()
+    addrs.update({"down_kbps": down, "up_kbps": up, "cap_kbps": cap})
+    return addrs
+
+
+def unit_name(svc: str) -> str:
+    return svc if svc.endswith(".service") else f"{svc}.service"
+
+
+def display_name(unit: str) -> str:
+    return unit.removesuffix(".service")
+
+
+def unit_from_list_units_line(line: str) -> str | None:
+    """Parse a systemctl list-units line; skip the status glyph (e.g. U+25CF)."""
+    unit_suffixes = (".service", ".socket", ".timer", ".mount", ".target")
+    for token in line.split():
+        cleaned = token.lstrip("\u25cf\u25cb\u00d7\u25c9")
+        if any(cleaned.endswith(suf) for suf in unit_suffixes):
+            return cleaned
+    return None
+
+
+def monitored_units() -> list[str]:
+    explicit = os.environ.get("MOTD_SERVICES", "").split()
+    if explicit:
+        return [unit_name(s) for s in explicit if s]
+    units: list[str] = []
+    for svc in SERVICE_CANDIDATES:
+        unit = unit_name(svc)
+        if not run(["systemctl", "list-unit-files", "--type=service", "--no-legend", unit]).strip():
+            continue
+        if systemctl_ok("systemctl", "is-enabled", "--quiet", unit):
+            units.append(unit)
+    return units
+
+
+def collect_services() -> dict[str, list[str]]:
+    empty = {"ok": [], "fail": [], "failed_units": []}
+    if not shutil.which("systemctl"):
+        return empty
+
+    ok: list[str] = []
+    fail: list[str] = []
+    monitored_names: set[str] = set()
+
+    for unit in monitored_units():
+        display = display_name(unit)
+        monitored_names.add(display)
+        if systemctl_ok("systemctl", "is-active", "--quiet", unit):
+            ok.append(display)
+        else:
+            fail.append(display)
+
+    failed_units: list[str] = []
+    for line in run([
+        "systemctl", "list-units", "--state=failed", "--no-legend", "--no-pager",
+    ]).splitlines():
+        unit = unit_from_list_units_line(line)
+        if not unit:
+            continue
+        display = display_name(unit)
+        if display not in monitored_names:
+            failed_units.append(display)
+
+    return {"ok": ok, "fail": fail, "failed_units": failed_units}
+
+
+def cpu_temp() -> int | None:
+    raw = os.environ.get("MOTD_PAYLOAD_CPU_TEMP", "").strip()
+    return int(raw) if raw.isdigit() else None
+
+
+def cpu_freq_mhz() -> int | None:
+    raw = os.environ.get("MOTD_PAYLOAD_CPU_FREQ", "").strip()
+    return int(raw) if raw.isdigit() else None
+
+
+payload = {
+    "width": int(os.environ["MOTD_PAYLOAD_W"]),
+    "host": os.environ["MOTD_PAYLOAD_HOST"],
+    "time": os.environ["MOTD_PAYLOAD_TIME"],
+    "theme": {"accent": os.environ["MOTD_PAYLOAD_ACCENT"]},
+    "cpu": {
+        "model": os.environ["MOTD_PAYLOAD_MODEL"],
+        "total_pct": int(os.environ["MOTD_PAYLOAD_CPU_PCT"]),
+        "freq_mhz": cpu_freq_mhz(),
+        "temp": cpu_temp(),
+    },
+    "mem": mem_stats(),
+    "disks": disk_rows(),
+    "gpu": collect_gpus(),
+    "net": collect_net(),
+    "services": collect_services(),
+}
+
+print(json.dumps(payload, separators=(",", ":")))
+PY
+}
+
+# ─────────────────────────────────────────────────────────────
+# Collect + render
+# ─────────────────────────────────────────────────────────────
+
+W=$(terminal_width)
+
+CPU_PCT=$(cpu_usage_pct)
+CPU_TEMP=$(cpu_temp_c || true)
+CPU_FREQ=$(cpu_freq_mhz || true)
+
+HOST=$(host_name)
+TIME=$(date '+%H:%M:%S')
+MODEL=$(cpu_model)
+ACCENT=$(motd_accent_sgr)
+
+export MOTD_PAYLOAD_W="$W"
+export MOTD_PAYLOAD_HOST="$HOST"
+export MOTD_PAYLOAD_TIME="$TIME"
+export MOTD_PAYLOAD_MODEL="$MODEL"
+export MOTD_PAYLOAD_CPU_PCT="$CPU_PCT"
+export MOTD_PAYLOAD_CPU_TEMP="${CPU_TEMP:-}"
+export MOTD_PAYLOAD_CPU_FREQ="${CPU_FREQ:-}"
+export MOTD_PAYLOAD_ACCENT="$ACCENT"
+export MOTD_MAX_DISKS
+export MOTD_NET_CAP_MBPS="${MOTD_NET_CAP_MBPS:-100}"
+export MOTD_SERVICES="${MOTD_SERVICES:-}"
+
+JSON=$(motd_payload_json)
+
+if [[ -f "$RENDERER" ]]; then
+    printf '%s' "$JSON" | python3 "$RENDERER"
+else
+    echo "motd-render.py not found at $RENDERER" >&2
+    exit 1
+fi
+echo
