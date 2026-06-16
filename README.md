@@ -23,7 +23,7 @@ Border colour, hostname, clock, and CPU/GPU labels match the login user's shell 
 From a clone of this repo (installer resolves paths from its own directory):
 
 ```bash
-git clone <repo-url> k-motd
+git clone https://github.com/AtticusG3/k-motd.git
 cd k-motd
 sudo ./install-motd.sh
 ```
